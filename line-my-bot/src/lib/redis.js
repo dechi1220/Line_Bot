@@ -1,5 +1,8 @@
-// 用 Upstash Redis 的 REST API 存資料（追蹤股票清單、美金到價區間、使用者 ID 等）。
-// 不需要另外安裝 redis client，用 fetch 打 REST API 就好，Render 免費方案也能用。
+// 用 Upstash Redis 的 REST API 存資料。
+// v2 資料結構：
+// - usd_settings：一個 JSON，存美金日報開關 + 多組到價提醒
+// - stocks：一個 Redis Hash，field = 股票代號，value = 該股票的 JSON 設定（含提醒清單）
+// - target_user_id：要推播給誰
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -16,53 +19,67 @@ async function redisCommand(...args) {
   return data.result;
 }
 
-// ---- 股票追蹤清單（用 Redis Set 存）----
+// ---------------- 美金設定 ----------------
+// { dailyReportEnabled: bool, alerts: [{ id, type: 'above'|'below', value, state: 'none'|'triggered' }] }
 
-async function getStockList() {
-  const result = await redisCommand("SMEMBERS", "stocks");
-  return result || [];
-}
+const DEFAULT_USD_SETTINGS = { dailyReportEnabled: true, alerts: [] };
 
-async function addStock(symbol) {
-  return redisCommand("SADD", "stocks", symbol);
-}
-
-async function removeStock(symbol) {
-  return redisCommand("SREM", "stocks", symbol);
-}
-
-// ---- 美金到價區間 ----
-
-const DEFAULT_RANGE = { low: 31, high: 33 };
-
-async function getUsdRange() {
-  const raw = await redisCommand("GET", "usd_range");
-  if (!raw) return DEFAULT_RANGE;
+async function getUsdSettings() {
+  const raw = await redisCommand("GET", "usd_settings");
+  if (!raw) return { ...DEFAULT_USD_SETTINGS, alerts: [] };
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return {
+      dailyReportEnabled: parsed.dailyReportEnabled ?? true,
+      alerts: Array.isArray(parsed.alerts) ? parsed.alerts : [],
+    };
   } catch {
-    return DEFAULT_RANGE;
+    return { ...DEFAULT_USD_SETTINGS, alerts: [] };
   }
 }
 
-async function setUsdRange(low, high) {
-  return redisCommand("SET", "usd_range", JSON.stringify({ low, high }));
+async function saveUsdSettings(settings) {
+  return redisCommand("SET", "usd_settings", JSON.stringify(settings));
 }
 
-// ---- 到價提醒狀態（避免同一個狀態一直重複通知）----
-// 狀態值：'above' | 'below' | 'none'
+// ---------------- 股票設定（Hash：field=代號, value=JSON）----------------
+// 每檔股票的 JSON： { alerts: [{ id, type, value, state }] }
 
-async function getAlertState() {
-  const state = await redisCommand("GET", "usd_alert_state");
-  return state || "none";
+async function getAllStocks() {
+  const raw = await redisCommand("HGETALL", "stocks");
+  const result = {};
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      const symbol = raw[i];
+      try {
+        result[symbol] = JSON.parse(raw[i + 1]);
+      } catch {
+        result[symbol] = { alerts: [] };
+      }
+    }
+  }
+  return result;
 }
 
-async function setAlertState(state) {
-  return redisCommand("SET", "usd_alert_state", state);
+async function getStock(symbol) {
+  const raw = await redisCommand("HGET", "stocks", symbol);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { alerts: [] };
+  }
 }
 
-// ---- 記住要推播給誰（LINE userId）----
-// 使用者第一次跟機器人說話時會存下來，之後排程任務才知道要推播給誰
+async function saveStock(symbol, data) {
+  return redisCommand("HSET", "stocks", symbol, JSON.stringify(data));
+}
+
+async function removeStock(symbol) {
+  return redisCommand("HDEL", "stocks", symbol);
+}
+
+// ---------------- 使用者 ----------------
 
 async function saveUserId(userId) {
   return redisCommand("SET", "target_user_id", userId);
@@ -73,13 +90,12 @@ async function getUserId() {
 }
 
 module.exports = {
-  getStockList,
-  addStock,
+  getUsdSettings,
+  saveUsdSettings,
+  getAllStocks,
+  getStock,
+  saveStock,
   removeStock,
-  getUsdRange,
-  setUsdRange,
-  getAlertState,
-  setAlertState,
   saveUserId,
   getUserId,
 };

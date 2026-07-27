@@ -1,94 +1,73 @@
-# LINE 美金到價 + 每日股票總結機器人
+# LINE 美金到價 + 股票總結機器人（v2）
 
 功能：
-1. 傳訊息管理你要追蹤的股票（台股/美股都支援）
-2. 美金匯率超過你設定的區間時，主動推播提醒你
-3. 每天固定時間（預設台北時間 14:00）發送美金匯率 + 所有追蹤股票的漲跌總結
-
-全部用免費方案就能跑起來：**Render**（跑程式）+ **Upstash Redis**（存資料）+ **GitHub Actions**（排程觸發）。
-
----
-
-## 你會用到的指令
-
-跟機器人加好友之後，直接傳文字訊息：
-
-| 指令 | 範例 | 說明 |
-|---|---|---|
-| 新增 [代號] | `新增 2330` 或 `新增 AAPL` | 開始追蹤這檔股票 |
-| 刪除 [代號] | `刪除 2330` | 停止追蹤 |
-| 清單 | `清單` | 看目前追蹤了哪些股票、美金區間設多少 |
-| 設定匯率 [低] [高] | `設定匯率 31 33` | 改美金到價提醒的區間 |
-| 說明 | `說明` | 列出所有指令 |
-
-台股代號直接打數字就好（例如 `2330`），程式會自動補上 `.TW`。美股直接打代碼（例如 `AAPL`、`TSLA`）。
+1. 查詢美金即時匯率、開關每日美金報告、自訂多組美金到價提醒（高於/低於）
+2. 查詢任意股票（台股/美股）的即時價格
+3. 幫自選股個別設定到價提醒
+4. 每天兩次自選股總結：開盤前總結（約 08:30）、收盤後總結（約 14:00，含美金）
 
 ---
 
-## 部署步驟
+## 指令列表
 
-### 1. 建立 LINE Bot
+### 美金
 
-1. 到 [LINE Developers Console](https://developers.line.biz/console/) 建立一個 Provider，再建立一個 **Messaging API** channel
-2. 在 channel 的「Messaging API」分頁：
-   - 產生並複製 **Channel access token**（長期）
-   - 「Basic settings」分頁可以找到 **Channel secret**
-3. 先把「自動回應訊息」「加入好友的歡迎訊息」都關掉（Messaging API 分頁裡有開關），避免跟我們自己的邏輯打架
-4. 用手機掃描 QR Code，把這個官方帳號加為好友（先加好友，之後才能收到推播）
+| 指令 | 說明 |
+|---|---|
+| `美金` | 查詢目前美金匯率、今日漲跌 |
+| `美金日報 開` / `美金日報 關` | 開關每日美金報告（附加在收盤後總結裡） |
+| `美金提醒 高於33` | 新增美金到價提醒，可以設多組，不會互相覆蓋 |
+| `美金提醒 低於31` | 同上，低於某個價位時提醒 |
+| `美金提醒清單` | 查看目前所有美金提醒（附編號） |
+| `刪除美金提醒 1` | 用清單裡的編號刪除某一組提醒 |
 
-### 2. 建立 Upstash Redis（免費）
+### 股票（台股輸入純數字代號會自動補 `.TW`，美股直接輸入代碼）
 
-1. 到 [upstash.com](https://upstash.com) 註冊，建立一個 Redis Database（選離你近的 region，例如新加坡或東京）
-2. 進到 Database 詳情頁，找到 **REST API** 區塊，複製：
-   - `UPSTASH_REDIS_REST_URL`
-   - `UPSTASH_REDIS_REST_TOKEN`
+| 指令 | 說明 |
+|---|---|
+| `查詢 2330` | 直接查詢股價，不用先加入清單 |
+| `新增 2330` | 加入自選股清單（會出現在每日總結裡） |
+| `刪除 2330` | 移除自選股（相關提醒也會一併刪除） |
+| `提醒 2330 高於600` | 幫這檔股票設到價提醒（如果還沒加入清單，會自動加進去） |
+| `提醒 2330 低於550` | 同上 |
+| `提醒清單 2330` | 查看這檔股票目前的提醒（附編號） |
+| `刪除提醒 2330 1` | 用編號刪除這檔股票的某一組提醒 |
 
-### 3. 上傳程式碼到 GitHub
+### 總覽
 
-把這個資料夾建立成一個新的 GitHub repository（可以設成 private）。
-
-### 4. 部署到 Render（免費）
-
-1. 到 [render.com](https://render.com)，New -> Web Service，選你剛剛的 repo
-2. 設定：
-   - Build Command: `npm install`
-   - Start Command: `npm start`
-3. 在 Environment 分頁加入環境變數（就是 `.env.example` 裡的那些）：
-   - `LINE_CHANNEL_ACCESS_TOKEN`
-   - `LINE_CHANNEL_SECRET`
-   - `UPSTASH_REDIS_REST_URL`
-   - `UPSTASH_REDIS_REST_TOKEN`
-   - `CRON_SECRET`（自己隨便打一串英數字亂碼即可，例如用密碼產生器產生）
-4. 部署完成後，你會拿到一個網址，例如 `https://your-bot.onrender.com`
-
-> 提醒：Render 免費方案閒置一段時間會「睡著」，收到請求後幾秒內會醒過來再回應，第一次呼叫可能會慢個幾秒，屬正常現象。
-
-### 5. 設定 LINE Webhook
-
-回到 LINE Developers Console -> Messaging API 分頁：
-1. Webhook URL 填：`https://your-bot.onrender.com/webhook`
-2. 打開「Use webhook」開關
-3. 點 Verify，確認顯示成功
-
-### 6. 設定 GitHub Actions（排程）
-
-到你的 GitHub repo -> Settings -> Secrets and variables -> Actions，新增兩個 Repository secrets：
-- `APP_URL`：你的 Render 網址，例如 `https://your-bot.onrender.com`（結尾不要加 `/`）
-- `CRON_SECRET`：跟 Render 環境變數裡設的那組亂碼一樣
-
-推上 GitHub 後，Actions 分頁應該就會看到 `機器人排程任務` 這個 workflow。
-
-### 7. 測試
-
-1. 用手機傳「說明」給機器人，應該會收到指令列表
-2. 傳「新增 2330」「新增 AAPL」「設定匯率 31 33」
-3. 傳「清單」確認有存進去
-4. 到 GitHub repo 的 Actions 分頁，找到 `機器人排程任務`，點右上角 **Run workflow** 手動觸發一次，確認會收到 LINE 推播（因為是手動觸發，`github.event.schedule` 會是空的，這次一定會走「到價檢查」那條路徑，可以先改 `src/index.js` 暫時直接測 `/daily-summary`，或直接瀏覽器打開 `https://your-bot.onrender.com/daily-summary?secret=你的CRON_SECRET` 測試也可以）
+| 指令 | 說明 |
+|---|---|
+| `清單` | 看目前所有自選股、美金日報狀態、各項提醒數量 |
+| `說明` | 列出所有指令 |
 
 ---
 
-## 之後可以擴充的方向
+## 每日總結的時間安排
 
-- Yahoo Finance 的查詢介面是非官方的，如果之後常常查詢失敗，可以換成 TWSE OpenAPI（台股）+ Finnhub 免費方案（美股）
-- 目前只支援一個使用者（一組 target_user_id）。如果你想讓家人朋友也能用，需要把資料結構改成「每個 userId 各自一份追蹤清單」
-- 到價提醒目前只有美金，架構上很容易比照同樣邏輯加上個股的到價提醒
+- **開盤前總結**（約台北時間 08:30）：列出所有自選股的最新價格與漲跌，主要用來掌握隔夜美股走勢跟台股前一日收盤狀況
+- **收盤後總結**（約台北時間 14:00）：一樣列出自選股，另外如果「美金日報」有開啟，會附上美金匯率
+
+如果想調整時間，改 `.github/workflows/cron.yml` 裡對應的 cron 時間即可（cron 用的是 UTC 時間，記得跟台北時間相差 8 小時）。
+
+---
+
+## ⚠️ 從 v1 升級的注意事項
+
+v2 把 Redis 的資料結構整個改掉了（原本股票清單存在 Set、美金設定存在單一 key，現在改成更彈性的 Hash + 提醒陣列結構），**v1 存的舊資料不會自動轉換過來**。
+
+升級後請重新用新指令設定一次：
+```
+新增 2330
+提醒 2330 高於600
+美金提醒 高於33
+美金提醒 低於31
+```
+資料量通常不多，重新打一次指令幾分鐘就能設定完。
+
+如果你想保留舊資料自動轉換，也可以告訴我，我可以另外寫一支一次性的搬移 script。
+
+---
+
+## 部署方式
+
+跟 v1 完全相同（Render + Upstash Redis + GitHub Actions），環境變數也沒有變。如果是第一次部署，請參考你原本的 v1 README；如果是從 v1 升級，直接把這個資料夾的內容覆蓋 push 上去、確認 Render 有自動重新部署即可，不需要重新設定環境變數或 Webhook。
