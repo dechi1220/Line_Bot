@@ -42,4 +42,45 @@ async function fetchQuote(symbol) {
   };
 }
 
-module.exports = { fetchQuote };
+// 抓一段期間的歷史日線資料，用來算近期高低點、區間漲跌幅
+// days: 想要取最近幾個「交易日」的資料（週末/假日不會計入，所以抓 range 要留一點餘裕）
+async function fetchHistory(symbol, days = 10) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`;
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`查詢歷史資料失敗 ${symbol}（HTTP ${res.status}）`);
+  }
+
+  const json = await res.json();
+  const result = json?.chart?.result?.[0];
+  if (!result || !result.timestamp) {
+    throw new Error(`查無歷史資料：${symbol}`);
+  }
+
+  const timestamps = result.timestamp;
+  const quoteData = result.indicators?.quote?.[0] || {};
+  const closes = quoteData.close || [];
+  const highs = quoteData.high || [];
+  const lows = quoteData.low || [];
+
+  const points = timestamps
+    .map((t, i) => ({
+      date: new Date(t * 1000),
+      close: closes[i],
+      high: highs[i],
+      low: lows[i],
+    }))
+    .filter((p) => p.close != null && p.high != null && p.low != null);
+
+  return points.slice(-days);
+}
+
+module.exports = { fetchQuote, fetchHistory };
+

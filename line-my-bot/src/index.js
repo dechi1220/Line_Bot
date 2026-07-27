@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { fetchQuote } = require("./lib/yahoo");
+const { fetchQuote, fetchHistory } = require("./lib/yahoo");
 const redisLib = require("./lib/redis");
 const lineLib = require("./lib/line");
 const { genId, evaluateAlert, describeAlert, parseAlertSpec } = require("./lib/alerts");
@@ -61,7 +61,15 @@ async function handleEvent(event) {
   }
 
   const text = event.message.text.trim();
-  const reply = await handleCommand(text);
+  let reply;
+  try {
+    reply = await handleCommand(text);
+  } catch (err) {
+    // 之前這種錯誤只會寫進 log、使用者完全看不到任何回覆，很難排查問題。
+    // 現在直接把錯誤訊息回傳給使用者，才能一眼看出是哪裡壞掉（例如 Redis 權限不足）。
+    console.error("指令處理發生錯誤:", err);
+    reply = `⚠️ 處理指令時發生錯誤：\n${err.message}`;
+  }
   await lineLib.replyMessage(event.replyToken, reply);
 }
 
@@ -92,6 +100,37 @@ async function handleCommand(text) {
       return `💵 美金即時匯率\n${formatQuoteLine({ ...q, name: "USD/TWD" })}`;
     } catch (err) {
       return `查詢美金匯率失敗：${err.message}`;
+    }
+  }
+
+  // ---------- 美金：近兩週高低點 ----------
+  if (cmd === "美金兩週") {
+    try {
+      const points = await fetchHistory(USD_SYMBOL, 10); // 兩週大約 10 個交易日
+      if (points.length === 0) return "查無近期資料";
+
+      const first = points[0];
+      const last = points[points.length - 1];
+      let highPoint = points[0];
+      let lowPoint = points[0];
+      for (const p of points) {
+        if (p.high > highPoint.high) highPoint = p;
+        if (p.low < lowPoint.low) lowPoint = p;
+      }
+
+      const changePercent = ((last.close - first.close) / first.close) * 100;
+      const sign = changePercent >= 0 ? "+" : "";
+      const fmtDate = (d) =>
+        d.toLocaleDateString("zh-TW", { timeZone: "Asia/Taipei", month: "numeric", day: "numeric" });
+
+      return [
+        `💵 美金近兩週走勢（${fmtDate(first.date)} ~ ${fmtDate(last.date)}）`,
+        `區間漲跌：${sign}${changePercent.toFixed(2)}%`,
+        `最高：${highPoint.high.toFixed(3)}（${fmtDate(highPoint.date)}）`,
+        `最低：${lowPoint.low.toFixed(3)}（${fmtDate(lowPoint.date)}）`,
+      ].join("\n");
+    } catch (err) {
+      return `查詢失敗：${err.message}`;
     }
   }
 
@@ -247,6 +286,7 @@ async function handleCommand(text) {
     return [
       "【美金】",
       "美金 - 查詢目前美金匯率",
+      "美金兩週 - 查看近兩週的漲跌幅、高低點與日期",
       "美金日報 開 / 美金日報 關 - 開關每日美金報告",
       "美金提醒 高於33 / 美金提醒 低於31 - 新增到價提醒（可設多組）",
       "美金提醒清單 - 查看目前所有美金提醒",
