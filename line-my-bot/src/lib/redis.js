@@ -1,7 +1,8 @@
 // 用 Upstash Redis 的 REST API 存資料。
 // v2 資料結構：
 // - usd_settings：一個 JSON，存美金日報開關 + 多組到價提醒
-// - stocks：一個 Redis Hash，field = 股票代號，value = 該股票的 JSON 設定（含提醒清單）
+// - stock_configs：一個 Redis Hash，field = 股票代號，value = 該股票的 JSON 設定（含提醒清單）
+//   （這個 key 名稱特意跟 v1 的 "stocks" Set 分開，避免 Redis 型別衝突）
 // - target_user_id：要推播給誰
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -46,7 +47,7 @@ async function saveUsdSettings(settings) {
 // 每檔股票的 JSON： { alerts: [{ id, type, value, state }] }
 
 async function getAllStocks() {
-  const raw = await redisCommand("HGETALL", "stocks");
+  const raw = await redisCommand("HGETALL", "stock_configs");
   const result = {};
   if (Array.isArray(raw)) {
     for (let i = 0; i < raw.length; i += 2) {
@@ -62,7 +63,7 @@ async function getAllStocks() {
 }
 
 async function getStock(symbol) {
-  const raw = await redisCommand("HGET", "stocks", symbol);
+  const raw = await redisCommand("HGET", "stock_configs", symbol);
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -72,11 +73,11 @@ async function getStock(symbol) {
 }
 
 async function saveStock(symbol, data) {
-  return redisCommand("HSET", "stocks", symbol, JSON.stringify(data));
+  return redisCommand("HSET", "stock_configs", symbol, JSON.stringify(data));
 }
 
 async function removeStock(symbol) {
-  return redisCommand("HDEL", "stocks", symbol);
+  return redisCommand("HDEL", "stock_configs", symbol);
 }
 
 // ---------------- 使用者 ----------------
