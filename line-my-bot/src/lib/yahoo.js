@@ -44,8 +44,8 @@ async function fetchQuote(symbol) {
 
 // 抓一段期間的歷史日線資料，用來算近期高低點、區間漲跌幅
 // days: 想要取最近幾個「交易日」的資料（週末/假日不會計入，所以抓 range 要留一點餘裕）
-async function fetchHistory(symbol, days = 10) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`;
+async function fetchHistory(symbol, days = 10, range = "1mo") {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`;
 
   const res = await fetch(url, {
     headers: {
