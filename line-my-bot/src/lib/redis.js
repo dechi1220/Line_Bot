@@ -21,9 +21,9 @@ async function redisCommand(...args) {
 }
 
 // ---------------- 美金設定 ----------------
-// { dailyReportEnabled: bool, alerts: [{ id, type: 'above'|'below', value, state: 'none'|'triggered' }] }
+// { dailyReportTime: "HH:MM" | null, lastReportSentDate: "YYYY-MM-DD" | null, alerts: [...] }
 
-const DEFAULT_USD_SETTINGS = { dailyReportEnabled: true, alerts: [] };
+const DEFAULT_USD_SETTINGS = { dailyReportTime: null, lastReportSentDate: null, alerts: [] };
 
 async function getUsdSettings() {
   const raw = await redisCommand("GET", "usd_settings");
@@ -31,7 +31,8 @@ async function getUsdSettings() {
   try {
     const parsed = JSON.parse(raw);
     return {
-      dailyReportEnabled: parsed.dailyReportEnabled ?? true,
+      dailyReportTime: parsed.dailyReportTime ?? null,
+      lastReportSentDate: parsed.lastReportSentDate ?? null,
       alerts: Array.isArray(parsed.alerts) ? parsed.alerts : [],
     };
   } catch {

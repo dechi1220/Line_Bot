@@ -9,7 +9,6 @@ const costLib = require("./lib/cost");
 
 const app = express();
 
-// LINE webhook 需要「原始 body」才能驗證簽章，所以這條路徑不能用 express.json()
 app.use("/webhook", express.raw({ type: "*/*" }));
 
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
@@ -26,7 +25,7 @@ function verifySignature(rawBody, signature) {
 }
 
 app.get("/", (req, res) => {
-  res.send("LINE 美金/股票提醒機器人運作中 ✅ (v2)");
+  res.send("LINE 美金/股票提醒機器人運作中 ✅ (v4)");
 });
 
 app.post("/webhook", async (req, res) => {
@@ -35,7 +34,7 @@ app.post("/webhook", async (req, res) => {
     return res.status(401).send("簽章驗證失敗");
   }
 
-  res.status(200).send("OK"); // 先回應 LINE，避免處理太久被判定逾時
+  res.status(200).send("OK");
 
   let body;
   try {
@@ -67,19 +66,20 @@ async function handleEvent(event) {
   try {
     reply = await handleCommand(text);
   } catch (err) {
-    // 之前這種錯誤只會寫進 log、使用者完全看不到任何回覆，很難排查問題。
-    // 現在直接把錯誤訊息回傳給使用者，才能一眼看出是哪裡壞掉（例如 Redis 權限不足）。
     console.error("指令處理發生錯誤:", err);
     reply = `⚠️ 處理指令時發生錯誤：\n${err.message}`;
   }
   await lineLib.replyMessage(event.replyToken, reply);
 }
 
-// 台股代號如果是純數字（例如 2330、0050），自動補上 .TW 後綴
 function normalizeSymbol(raw) {
   const s = raw.toUpperCase();
   if (/^\d{4,6}$/.test(s)) return `${s}.TW`;
   return s;
+}
+
+function isUsdTarget(token) {
+  return token === "美金" || token.toUpperCase() === "USD";
 }
 
 function formatQuoteLine(q) {
@@ -88,7 +88,6 @@ function formatQuoteLine(q) {
   return `${arrow} ${q.name}（${q.symbol}）\n目前價格：${q.price.toFixed(2)}\n今日漲跌：${sign}${q.change.toFixed(2)} (${sign}${q.changePercent.toFixed(2)}%)`;
 }
 
-// 解析像「15」「15%」這樣的百分比輸入
 function parsePercent(text) {
   const cleaned = (text || "").replace(/%/g, "").trim();
   const value = parseFloat(cleaned);
@@ -96,10 +95,8 @@ function parsePercent(text) {
   return value;
 }
 
-// 確保股票有一份預設完整的設定物件（相容舊資料，欄位不存在就補上）
 function ensureStockShape(stock) {
   return {
-    category: stock?.category || null,
     costBasis: stock?.costBasis ?? null,
     costAlerts: stock?.costAlerts || [],
     alerts: stock?.alerts || [],
@@ -109,14 +106,25 @@ function ensureStockShape(stock) {
   };
 }
 
-// ------------------------------------------------
-// 指令處理
-// ------------------------------------------------
+function nowTaipeiHHMM() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Taipei",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const hh = parts.find((p) => p.type === "hour").value;
+  const mm = parts.find((p) => p.type === "minute").value;
+  return `${hh}:${mm}`;
+}
+
+function todayTaipeiDateStr() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" });
+}
 
 async function handleCommand(text) {
   const [cmd, ...rest] = text.split(/\s+/);
 
-  // ---------- 美金：查詢 ----------
   if (cmd === "美金" || cmd === "查詢美金") {
     try {
       const q = await fetchQuote(USD_SYMBOL);
@@ -126,10 +134,9 @@ async function handleCommand(text) {
     }
   }
 
-  // ---------- 美金：近兩週高低點 ----------
   if (cmd === "美金兩週") {
     try {
-      const points = await fetchHistory(USD_SYMBOL, 10); // 兩週大約 10 個交易日
+      const points = await fetchHistory(USD_SYMBOL, 10);
       if (points.length === 0) return "查無近期資料";
 
       const first = points[0];
@@ -157,51 +164,119 @@ async function handleCommand(text) {
     }
   }
 
-  // ---------- 美金：每日報告開關 ----------
   if (cmd === "美金日報") {
-    const setting = rest[0];
-    if (setting !== "開" && setting !== "關") {
-      return "格式錯誤，請用：美金日報 開　或　美金日報 關";
+    const arg = rest[0];
+    if (!arg) {
+      return "格式錯誤，請用：美金日報 1030（代表每天 10:30 發送）　或　美金日報 關";
     }
+
+    if (arg === "關") {
+      const settings = await redisLib.getUsdSettings();
+      settings.dailyReportTime = null;
+      await redisLib.saveUsdSettings(settings);
+      return "已關閉美金日報";
+    }
+
+    const match = arg.match(/^([01]\d|2[0-3])([0-5]\d)$/);
+    if (!match) {
+      return "時間格式錯誤，請用 24 小時制四碼，例如：美金日報 1030（代表 10:30）";
+    }
+    const time = `${match[1]}:${match[2]}`;
     const settings = await redisLib.getUsdSettings();
-    settings.dailyReportEnabled = setting === "開";
+    settings.dailyReportTime = time;
+    settings.lastReportSentDate = null;
     await redisLib.saveUsdSettings(settings);
-    return `已${setting === "開" ? "開啟" : "關閉"}每日美金價格報告`;
+    return `已開啟美金日報，每天約 ${time} 發送`;
   }
 
-  // ---------- 美金：新增到價提醒 ----------
-  if (cmd === "美金提醒") {
-    const spec = parseAlertSpec(rest.join(""));
+  if (cmd === "提醒" && rest[0] && rest[1] !== undefined) {
+    const target = rest[0];
+    const spec = parseAlertSpec(rest.slice(1).join(""));
     if (!spec) {
-      return "格式錯誤，請用：美金提醒 高於33　或　美金提醒 低於31";
+      return "格式錯誤，請用：提醒 美金 高於33　或　提醒 2330 高於600";
     }
-    const settings = await redisLib.getUsdSettings();
-    settings.alerts.push({ id: genId(), type: spec.type, value: spec.value, state: "none" });
-    await redisLib.saveUsdSettings(settings);
-    return `已新增美金提醒：${describeAlert(spec)}`;
-  }
 
-  // ---------- 美金：提醒清單 ----------
-  if (cmd === "美金提醒清單") {
-    const settings = await redisLib.getUsdSettings();
-    if (settings.alerts.length === 0) return "目前沒有設定任何美金到價提醒。";
-    const lines = settings.alerts.map((a, i) => `${i + 1}. ${describeAlert(a)}`);
-    return `美金到價提醒：\n${lines.join("\n")}`;
-  }
-
-  // ---------- 美金：刪除提醒 ----------
-  if (cmd === "刪除美金提醒") {
-    const index = parseInt(rest[0], 10) - 1;
-    const settings = await redisLib.getUsdSettings();
-    if (Number.isNaN(index) || index < 0 || index >= settings.alerts.length) {
-      return "編號不存在，先傳「美金提醒清單」確認編號。";
+    if (isUsdTarget(target)) {
+      const settings = await redisLib.getUsdSettings();
+      settings.alerts.push({ id: genId(), type: spec.type, value: spec.value, state: "none" });
+      await redisLib.saveUsdSettings(settings);
+      return `已新增美金提醒：${describeAlert(spec)}`;
     }
-    const removed = settings.alerts.splice(index, 1)[0];
-    await redisLib.saveUsdSettings(settings);
-    return `已刪除美金提醒：${describeAlert(removed)}`;
+
+    const symbol = normalizeSymbol(target);
+    try {
+      await fetchQuote(symbol);
+    } catch {
+      return `查不到「${symbol}」的報價，請確認代號是否正確。`;
+    }
+    let stock = await redisLib.getStock(symbol);
+    const autoAdded = !stock;
+    stock = ensureStockShape(stock);
+    stock.alerts.push({ id: genId(), type: spec.type, value: spec.value, state: "none" });
+    await redisLib.saveStock(symbol, stock);
+    return `已新增「${symbol}」的到價提醒：${describeAlert(spec)}${autoAdded ? "\n（已自動加入自選股清單）" : ""}`;
   }
 
-  // ---------- 股票：查詢（不用先加入清單）----------
+  if (cmd === "提醒清單") {
+    const target = rest[0];
+
+    if (!target) {
+      const usdSettings = await redisLib.getUsdSettings();
+      const stocks = await redisLib.getAllStocks();
+      const lines = [];
+
+      if (usdSettings.alerts.length > 0) {
+        lines.push("💵 美金：");
+        usdSettings.alerts.forEach((a, i) => lines.push(`${i + 1}. ${describeAlert(a)}`));
+      }
+      for (const [symbol, raw] of Object.entries(stocks)) {
+        const stock = ensureStockShape(raw);
+        if (stock.alerts.length === 0) continue;
+        if (lines.length > 0) lines.push("");
+        lines.push(`📈 ${symbol}：`);
+        stock.alerts.forEach((a, i) => lines.push(`${i + 1}. ${describeAlert(a)}`));
+      }
+      return lines.length > 0 ? lines.join("\n") : "目前沒有設定任何到價提醒。";
+    }
+
+    if (isUsdTarget(target)) {
+      const settings = await redisLib.getUsdSettings();
+      if (settings.alerts.length === 0) return "目前沒有設定任何美金到價提醒。";
+      const lines = settings.alerts.map((a, i) => `${i + 1}. ${describeAlert(a)}`);
+      return `美金到價提醒：\n${lines.join("\n")}`;
+    }
+
+    const symbol = normalizeSymbol(target);
+    const stock = ensureStockShape(await redisLib.getStock(symbol));
+    if (stock.alerts.length === 0) return `「${symbol}」目前沒有設定任何到價提醒。`;
+    const lines = stock.alerts.map((a, i) => `${i + 1}. ${describeAlert(a)}`);
+    return `「${symbol}」的到價提醒：\n${lines.join("\n")}`;
+  }
+
+  if (cmd === "刪除提醒" && rest[0] && rest[1] !== undefined) {
+    const target = rest[0];
+    const index = parseInt(rest[1], 10) - 1;
+
+    if (isUsdTarget(target)) {
+      const settings = await redisLib.getUsdSettings();
+      if (Number.isNaN(index) || index < 0 || index >= settings.alerts.length) {
+        return "編號不存在，先傳「提醒清單 美金」確認編號。";
+      }
+      const removed = settings.alerts.splice(index, 1)[0];
+      await redisLib.saveUsdSettings(settings);
+      return `已刪除美金提醒：${describeAlert(removed)}`;
+    }
+
+    const symbol = normalizeSymbol(target);
+    const stock = ensureStockShape(await redisLib.getStock(symbol));
+    if (Number.isNaN(index) || index < 0 || index >= stock.alerts.length) {
+      return `編號不存在，先傳「提醒清單 ${symbol}」確認編號。`;
+    }
+    const removed = stock.alerts.splice(index, 1)[0];
+    await redisLib.saveStock(symbol, stock);
+    return `已刪除「${symbol}」的提醒：${describeAlert(removed)}`;
+  }
+
   if (cmd === "查詢" && rest[0]) {
     const symbol = normalizeSymbol(rest[0]);
     try {
@@ -212,7 +287,6 @@ async function handleCommand(text) {
     }
   }
 
-  // ---------- 股票：新增自選 ----------
   if (cmd === "新增" && rest[0]) {
     const symbol = normalizeSymbol(rest[0]);
     try {
@@ -222,80 +296,16 @@ async function handleCommand(text) {
     }
     const existing = await redisLib.getStock(symbol);
     if (existing) return `「${symbol}」已經在自選股清單裡了。`;
-    await redisLib.saveStock(symbol, { alerts: [] });
+    await redisLib.saveStock(symbol, ensureStockShape(null));
     return `已新增自選股：${symbol}`;
   }
 
-  // ---------- 股票：刪除自選 ----------
   if (cmd === "刪除" && rest[0]) {
     const symbol = normalizeSymbol(rest[0]);
     await redisLib.removeStock(symbol);
-    return `已刪除自選股：${symbol}（相關的到價提醒也會一併移除）`;
+    return `已刪除自選股：${symbol}（相關的提醒也會一併移除）`;
   }
 
-  // ---------- 股票：新增到價提醒 ----------
-  if (cmd === "提醒" && rest[0] && rest[1] !== undefined) {
-    const symbol = normalizeSymbol(rest[0]);
-    const spec = parseAlertSpec(rest.slice(1).join(""));
-    if (!spec) {
-      return "格式錯誤，請用：提醒 2330 高於600　或　提醒 2330 低於550";
-    }
-    try {
-      await fetchQuote(symbol);
-    } catch {
-      return `查不到「${symbol}」的報價，請確認代號是否正確。`;
-    }
-    let stock = await redisLib.getStock(symbol);
-    let autoAdded = false;
-    if (!stock) {
-      stock = { alerts: [] };
-      autoAdded = true;
-    }
-    stock.alerts.push({ id: genId(), type: spec.type, value: spec.value, state: "none" });
-    await redisLib.saveStock(symbol, stock);
-    return `已新增「${symbol}」的到價提醒：${describeAlert(spec)}${autoAdded ? "\n（已自動加入自選股清單）" : ""}`;
-  }
-
-  // ---------- 股票：提醒清單 ----------
-  if (cmd === "提醒清單" && rest[0]) {
-    const symbol = normalizeSymbol(rest[0]);
-    const stock = await redisLib.getStock(symbol);
-    if (!stock || stock.alerts.length === 0) {
-      return `「${symbol}」目前沒有設定任何到價提醒。`;
-    }
-    const lines = stock.alerts.map((a, i) => `${i + 1}. ${describeAlert(a)}`);
-    return `「${symbol}」的到價提醒：\n${lines.join("\n")}`;
-  }
-
-  // ---------- 股票：刪除提醒 ----------
-  if (cmd === "刪除提醒" && rest[0] && rest[1] !== undefined) {
-    const symbol = normalizeSymbol(rest[0]);
-    const index = parseInt(rest[1], 10) - 1;
-    const stock = await redisLib.getStock(symbol);
-    if (!stock || Number.isNaN(index) || index < 0 || index >= stock.alerts.length) {
-      return `編號不存在，先傳「提醒清單 ${symbol}」確認編號。`;
-    }
-    const removed = stock.alerts.splice(index, 1)[0];
-    await redisLib.saveStock(symbol, stock);
-    return `已刪除「${symbol}」的提醒：${describeAlert(removed)}`;
-  }
-
-  // ---------- 股票：分類（核心／衛星）----------
-  if (cmd === "分類" && rest[0] && rest[1]) {
-    const symbol = normalizeSymbol(rest[0]);
-    const label = rest[1];
-    if (label !== "核心" && label !== "衛星") {
-      return "格式錯誤，請用：分類 2330 核心　或　分類 2330 衛星";
-    }
-    let stock = await redisLib.getStock(symbol);
-    if (!stock) return `「${symbol}」還沒加入自選股清單，先傳「新增 ${symbol}」。`;
-    stock = ensureStockShape(stock);
-    stock.category = label === "核心" ? "core" : "satellite";
-    await redisLib.saveStock(symbol, stock);
-    return `已將「${symbol}」分類為${label}持股`;
-  }
-
-  // ---------- 股票：設定成本 ----------
   if (cmd === "成本" && rest[0] && rest[1]) {
     const symbol = normalizeSymbol(rest[0]);
     const cost = parseFloat(rest[1]);
@@ -318,7 +328,6 @@ async function handleCommand(text) {
     return `已設定「${symbol}」成本：${cost}${autoAdded ? "\n（已自動加入自選股清單）" : ""}`;
   }
 
-  // ---------- 股票：查看損益 ----------
   if (cmd === "損益" && rest[0]) {
     const symbol = normalizeSymbol(rest[0]);
     const stock = ensureStockShape(await redisLib.getStock(symbol));
@@ -336,7 +345,6 @@ async function handleCommand(text) {
     }
   }
 
-  // ---------- 股票：停利／停損／加碼提醒 ----------
   if ((cmd === "停利" || cmd === "停損" || cmd === "加碼提醒") && rest[0] && rest[1] !== undefined) {
     const symbol = normalizeSymbol(rest[0]);
     const percent = parsePercent(rest[1]);
@@ -355,7 +363,6 @@ async function handleCommand(text) {
     return `已新增「${symbol}」提醒：${costLib.describeCostAlert(stock.costBasis, alert)}`;
   }
 
-  // ---------- 股票：成本提醒清單 ----------
   if (cmd === "成本提醒清單" && rest[0]) {
     const symbol = normalizeSymbol(rest[0]);
     const stock = ensureStockShape(await redisLib.getStock(symbol));
@@ -368,7 +375,6 @@ async function handleCommand(text) {
     return `「${symbol}」成本提醒（成本：${stock.costBasis}）：\n${lines.join("\n")}`;
   }
 
-  // ---------- 股票：刪除成本提醒 ----------
   if (cmd === "刪除成本提醒" && rest[0] && rest[1] !== undefined) {
     const symbol = normalizeSymbol(rest[0]);
     const index = parseInt(rest[1], 10) - 1;
@@ -381,7 +387,6 @@ async function handleCommand(text) {
     return `已刪除「${symbol}」的提醒：${costLib.describeCostAlert(stock.costBasis, removed)}`;
   }
 
-  // ---------- 股票：技術指標提醒開關（均線交叉 + RSI）----------
   if (cmd === "技術提醒" && rest[0] && rest[1]) {
     const symbol = normalizeSymbol(rest[0]);
     const setting = rest[1];
@@ -406,8 +411,6 @@ async function handleCommand(text) {
       return `已關閉「${symbol}」的技術指標提醒`;
     }
 
-    // 開啟時：先抓歷史資料，把「目前狀態」記錄下來當基準，不主動通知，
-    // 避免一開啟就因為「從無到有」被當成一次訊號誤發通知。
     try {
       const points = await fetchHistory(symbol, 90, "3mo");
       const closes = points.map((p) => p.close);
@@ -434,14 +437,13 @@ async function handleCommand(text) {
     }
   }
 
-  // ---------- 總覽 ----------
   if (cmd === "清單") {
     const stocksRaw = await redisLib.getAllStocks();
     const usdSettings = await redisLib.getUsdSettings();
     const symbols = Object.keys(stocksRaw);
 
     const lines = ["📋 目前設定總覽", ""];
-    lines.push(`💵 美金每日報告：${usdSettings.dailyReportEnabled ? "開啟" : "關閉"}`);
+    lines.push(`💵 美金日報：${usdSettings.dailyReportTime ? `每天約 ${usdSettings.dailyReportTime}` : "關閉"}`);
     lines.push(`💵 美金到價提醒：${usdSettings.alerts.length} 組`);
 
     if (symbols.length === 0) {
@@ -449,83 +451,58 @@ async function handleCommand(text) {
       return lines.join("\n");
     }
 
-    const describeStockLine = (symbol, stock) => {
+    lines.push("", "📈 自選股：");
+    for (const symbol of symbols) {
+      const stock = ensureStockShape(stocksRaw[symbol]);
       const parts = [`・${symbol}`];
       if (stock.costBasis) parts.push(`成本${stock.costBasis}`);
       if (stock.alerts.length > 0) parts.push(`到價${stock.alerts.length}組`);
       if (stock.costAlerts.length > 0) parts.push(`損益提醒${stock.costAlerts.length}組`);
       if (stock.technicalEnabled) parts.push("技術指標已開啟");
-      return parts.join("｜");
-    };
-
-    const core = [];
-    const satellite = [];
-    const uncategorized = [];
-    for (const symbol of symbols) {
-      const stock = ensureStockShape(stocksRaw[symbol]);
-      if (stock.category === "core") core.push([symbol, stock]);
-      else if (stock.category === "satellite") satellite.push([symbol, stock]);
-      else uncategorized.push([symbol, stock]);
-    }
-
-    if (core.length > 0) {
-      lines.push("", "🏛 核心持股：");
-      for (const [symbol, stock] of core) lines.push(describeStockLine(symbol, stock));
-    }
-    if (satellite.length > 0) {
-      lines.push("", "🛰 衛星持股：");
-      for (const [symbol, stock] of satellite) lines.push(describeStockLine(symbol, stock));
-    }
-    if (uncategorized.length > 0) {
-      lines.push("", "📈 尚未分類：");
-      for (const [symbol, stock] of uncategorized) lines.push(describeStockLine(symbol, stock));
-      lines.push("（可用「分類 股票代號 核心」或「分類 股票代號 衛星」分類）");
+      lines.push(parts.join("｜"));
     }
 
     return lines.join("\n");
   }
 
-  // ---------- 說明 ----------
   if (cmd === "說明" || cmd.toLowerCase() === "help") {
     return [
       "【美金】",
-      "美金 - 查詢目前美金匯率",
-      "美金兩週 - 查看近兩週的漲跌幅、高低點與日期",
-      "美金日報 開 / 美金日報 關 - 開關每日美金報告",
-      "美金提醒 高於33 / 美金提醒 低於31 - 新增到價提醒（可設多組）",
-      "美金提醒清單 - 查看目前所有美金提醒",
-      "刪除美金提醒 [編號] - 刪除指定的美金提醒",
+      "「美金」查詢目前美金匯率",
+      "「美金兩週」查看近兩週的漲跌幅、高低點與日期",
+      "「美金日報 1030」開啟美金日報，每天約 10:30 發送（24小時制四碼）",
+      "「美金日報 關」關閉美金日報",
       "",
-      "【股票】",
-      "查詢 2330 - 直接查詢股價，不用先加入清單",
-      "新增 2330 - 加入自選股清單",
-      "刪除 2330 - 移除自選股",
-      "分類 2330 核心 / 分類 2330 衛星 - 標記長期核心持股或短期衛星持股（純顯示分組用）",
-      "提醒 2330 高於600 - 用實際價格設到價提醒",
-      "提醒清單 2330 / 刪除提醒 2330 1",
+      "【到價提醒（美金、股票通用）】",
+      "「提醒 美金 高於33」「提醒 美金 低於31」新增美金到價提醒",
+      "「提醒 2330 高於600」「提醒 2330 低於550」新增股票到價提醒（未加入清單會自動加入）",
+      "「提醒清單」查看全部到價提醒",
+      "「提醒清單 美金」「提醒清單 2330」查看指定的到價提醒",
+      "「刪除提醒 美金 1」「刪除提醒 2330 1」用編號刪除",
       "",
-      "【成本、停利停損、加碼（核心持股逢低加碼很適合用這組）】",
-      "成本 2330 550 - 設定持有成本",
-      "損益 2330 - 查看目前損益 %",
-      "停利 2330 15 - 漲到成本+15% 提醒",
-      "停損 2330 8 - 跌到成本-8% 提醒",
-      "加碼提醒 2330 10 - 跌到成本-10% 提醒（適合core持股逢低加碼）",
-      "成本提醒清單 2330 / 刪除成本提醒 2330 1",
+      "【股票基本】",
+      "「查詢 2330」直接查詢股價，不用先加入清單",
+      "「新增 2330」加入自選股清單",
+      "「刪除 2330」移除自選股",
       "",
-      "【技術指標（衛星持股波段操作輔助）】",
-      "技術提醒 2330 開 - 開啟均線交叉(5日/20日) + RSI過熱過冷通知",
-      "技術提醒 2330 關 - 關閉",
+      "【成本、停利停損、加碼】",
+      "「成本 2330 550」設定持有成本",
+      "「損益 2330」查看目前損益 %",
+      "「停利 2330 15」漲到成本+15% 提醒",
+      "「停損 2330 8」跌到成本-8% 提醒",
+      "「加碼提醒 2330 10」跌到成本-10% 提醒（適合核心持股逢低加碼）",
+      "「成本提醒清單 2330」「刪除成本提醒 2330 1」",
       "",
-      "清單 - 總覽所有設定",
+      "【技術指標（波段操作輔助）】",
+      "「技術提醒 2330 開」開啟均線交叉(5日/20日) + RSI過熱過冷通知",
+      "「技術提醒 2330 關」關閉",
+      "",
+      "「清單」總覽所有設定",
     ].join("\n");
   }
 
   return "看不懂這個指令 🤔 輸入「說明」看看可以做什麼。";
 }
-
-// ------------------------------------------------
-// 給 GitHub Actions 排程呼叫的端點
-// ------------------------------------------------
 
 function checkCronAuth(req, res) {
   if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
@@ -535,7 +512,6 @@ function checkCronAuth(req, res) {
   return true;
 }
 
-// 到價檢查：美金 + 所有有設定提醒的股票
 app.get("/check-alerts", async (req, res) => {
   if (!checkCronAuth(req, res)) return;
 
@@ -545,10 +521,10 @@ app.get("/check-alerts", async (req, res) => {
 
     const messages = [];
 
-    // 美金
     const usdSettings = await redisLib.getUsdSettings();
+    let usdQuote = null;
     if (usdSettings.alerts.length > 0) {
-      const usdQuote = await fetchQuote(USD_SYMBOL);
+      usdQuote = await fetchQuote(USD_SYMBOL);
       let changed = false;
       for (const alert of usdSettings.alerts) {
         const { shouldNotify, newState } = evaluateAlert(alert, usdQuote.price);
@@ -565,7 +541,26 @@ app.get("/check-alerts", async (req, res) => {
       if (changed) await redisLib.saveUsdSettings(usdSettings);
     }
 
-    // 股票
+    if (usdSettings.dailyReportTime) {
+      const today = todayTaipeiDateStr();
+      if (usdSettings.lastReportSentDate !== today) {
+        const nowHHMM = nowTaipeiHHMM();
+        const [nowH, nowM] = nowHHMM.split(":").map(Number);
+        const [targetH, targetM] = usdSettings.dailyReportTime.split(":").map(Number);
+        const diff = Math.abs(nowH * 60 + nowM - (targetH * 60 + targetM));
+        if (diff <= 15) {
+          const quote = usdQuote || (await fetchQuote(USD_SYMBOL));
+          const sign = quote.changePercent >= 0 ? "+" : "";
+          await lineLib.pushMessage(
+            userId,
+            `💵 美金日報\n目前匯率：${quote.price.toFixed(3)} (${sign}${quote.changePercent.toFixed(2)}%)`
+          );
+          usdSettings.lastReportSentDate = today;
+          await redisLib.saveUsdSettings(usdSettings);
+        }
+      }
+    }
+
     const stocks = await redisLib.getAllStocks();
     for (const [symbol, rawData] of Object.entries(stocks)) {
       const data = ensureStockShape(rawData);
@@ -626,7 +621,6 @@ app.get("/check-alerts", async (req, res) => {
   }
 });
 
-// 技術指標檢查：均線交叉 + RSI 區間轉換，一天檢查一次、只用收盤價判斷，避免盤中雜訊
 app.get("/technical-check", async (req, res) => {
   if (!checkCronAuth(req, res)) return;
 
@@ -656,7 +650,6 @@ app.get("/technical-check", async (req, res) => {
       const relation = computeMARelation(closes, 5, 20);
       if (relation && relation !== data.maRelation) {
         if (data.maRelation != null) {
-          // 有基準狀態才通知，避免第一次開啟就誤判成一次交叉
           const crossType = relation === "above" ? "黃金交叉" : "死亡交叉";
           const emoji = relation === "above" ? "🌟" : "⚠️";
           messages.push(
@@ -723,7 +716,6 @@ function todayLabel() {
   });
 }
 
-// 開盤前總結：主要用來看隔夜美股的變化 + 台股前一日收盤價
 app.get("/premarket-summary", async (req, res) => {
   if (!checkCronAuth(req, res)) return;
   try {
@@ -741,24 +733,14 @@ app.get("/premarket-summary", async (req, res) => {
   }
 });
 
-// 收盤後總結：台股收盤價 + 美金匯率（如果有開啟每日報告）
 app.get("/close-summary", async (req, res) => {
   if (!checkCronAuth(req, res)) return;
   try {
     const userId = await redisLib.getUserId();
     if (!userId) return res.send("尚無使用者跟機器人說過話，略過總結");
 
-    const lines = [`🌇 收盤後總結（${todayLabel()}）`];
-
-    const usdSettings = await redisLib.getUsdSettings();
-    if (usdSettings.dailyReportEnabled) {
-      const usd = await fetchQuote(USD_SYMBOL);
-      const sign = usd.changePercent >= 0 ? "+" : "";
-      lines.push("", `💵 美金匯率：${usd.price.toFixed(3)} (${sign}${usd.changePercent.toFixed(2)}%)`);
-    }
-
     const stockLines = await buildStockSummaryLines();
-    lines.push("", "📈 自選股：", ...stockLines);
+    const lines = [`🌇 收盤後總結（${todayLabel()}）`, "", "📈 自選股：", ...stockLines];
 
     await lineLib.pushMessage(userId, lines.join("\n"));
     res.send("收盤後總結已發送");
